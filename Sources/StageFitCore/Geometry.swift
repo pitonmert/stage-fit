@@ -3,7 +3,7 @@ import Foundation
 
 public struct LayoutConfiguration: Sendable {
     public var margin: CGFloat = 9
-    public var fallbackSidebarWidth: CGFloat = 190
+    public var stageReserveWidth: CGFloat = 190
     public init() {}
 }
 
@@ -23,7 +23,9 @@ public struct Display: Sendable {
     public func layoutArea(configuration: LayoutConfiguration = .init()) throws -> CGRect {
         guard visibleFrame.isUsable else { throw LayoutError.insufficientSpace }
         let margin = configuration.margin
-        let sidebar = stageExtent > 0 ? stageExtent + margin : configuration.fallbackSidebarWidth
+        // Thumbnail widths change with foreground membership. Keep the layout
+        // reserve independent of those previews for visible and hidden groups.
+        let sidebar = configuration.stageReserveWidth + margin
         let area = CGRect(x: (visibleFrame.minX + sidebar).rounded(),
                           y: (visibleFrame.minY + margin).rounded(),
                           width: (visibleFrame.width - sidebar - margin).rounded(),
@@ -55,10 +57,14 @@ public enum Geometry {
     }
 
     public static func pair(in area: CGRect, gap: CGFloat,
-                            minimumLeft: CGFloat = 1, minimumRight: CGFloat = 1) throws -> [CGRect] {
-        let available = area.width - gap
-        guard available >= minimumLeft + minimumRight else { throw LayoutError.pairDoesNotFit }
-        let left = max(minimumLeft, min(floor(available / 2), available - minimumRight))
+                            minimumLeft: CGFloat = 1, minimumRight: CGFloat = 1,
+                            maximumLeft: CGFloat = .infinity, maximumRight: CGFloat = .infinity) throws -> [CGRect] {
+        let available = min(area.width - gap, maximumLeft + maximumRight)
+        let lower = max(minimumLeft, available - maximumRight)
+        let upper = min(maximumLeft, available - minimumRight)
+        guard available >= minimumLeft + minimumRight, lower <= upper,
+              minimumLeft <= maximumLeft, minimumRight <= maximumRight else { throw LayoutError.pairDoesNotFit }
+        let left = max(lower, min(floor(available / 2), upper))
         return [CGRect(x: area.minX, y: area.minY, width: left, height: area.height),
                 CGRect(x: area.minX + left + gap, y: area.minY,
                        width: available - left, height: area.height)]
@@ -70,7 +76,7 @@ public enum Geometry {
     }
 }
 
-public struct RenderedWindow: Sendable {
+public struct RenderedWindow: Sendable, Equatable {
     public let pid: Int32
     public let frame: CGRect
     public init(pid: Int32, frame: CGRect) { self.pid = pid; self.frame = frame }
@@ -80,8 +86,10 @@ public struct StageStrip: Sendable {
     public let screenOrigin: CGPoint
     public let frame: CGRect
     public let buttons: [CGRect]
-    public init(screenOrigin: CGPoint, frame: CGRect, buttons: [CGRect]) {
+    public let windowGroups: [[UInt32]]
+    public init(screenOrigin: CGPoint, frame: CGRect, buttons: [CGRect], windowGroups: [[UInt32]] = []) {
         self.screenOrigin = screenOrigin; self.frame = frame; self.buttons = buttons
+        self.windowGroups = windowGroups
     }
 }
 
@@ -96,8 +104,8 @@ public enum StageGeometry {
                   strip.frame.minX <= display.visibleFrame.minX + display.visibleFrame.width / 4 else { continue }
             for window in rendered where window.frame.isUsable {
                 let frame = window.frame
-                guard abs(frame.minX - strip.frame.minX) <= 2 else { continue }
                 let isThumbnail = strip.buttons.contains { button in
+                    frame.minX >= button.minX - 2 && frame.maxX <= button.maxX + 2 &&
                     frame.width <= button.width + 2 && frame.height <= button.height + 32 &&
                     frame.minY < button.maxY && frame.maxY > button.minY
                 }

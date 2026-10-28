@@ -11,18 +11,40 @@ import StageFitCore
     private var pending: Set<WindowID> = []
     private var debounce: DispatchWorkItem?
     private var generation = 0
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    var onExpired: (() -> Void)?
+
+    private func schedule(delay: TimeInterval = 0, _ operation: @escaping @MainActor () async -> Void) {
+        let id = UUID(), epoch = generation
+        tasks[id] = Task { [weak self] in
+            defer { self?.tasks.removeValue(forKey: id) }
+            do { if delay > 0 { try await Task.sleep(for: .seconds(delay)) } }
+            catch { return }
+            guard let self, self.generation == epoch, !Task.isCancelled else { return }
+            await operation()
+        }
+    }
 
     init(windows: AccessibilityWindows, enqueue: @escaping (Set<WindowID>) -> Void) {
         self.windows = windows; self.enqueue = enqueue
     }
 
-    func start(includeExisting: Bool) {
+    func start() {
         guard !tracker.isRunning else { return }
         generation += 1
-        let apps = NSWorkspace.shared.runningApplications.filter { windows.isEligible($0) }
-        let existing = apps.reduce(into: Set<WindowID>()) { $0.formUnion(windows.windows(of: $1)) }
-        queue(tracker.start(existing: existing, includeExisting: includeExisting))
-        for app in apps { attachWithRetries(app) }
+        tracker.start(existing: [])
+        // Baseline enumeration runs off MainActor. Subscribe before it finishes so
+        // notifications during startup are not lost.
+        let apps = NSWorkspace.shared.runningApplications.filter(AccessibilityWindows.isEligible)
+        schedule { [weak self] in
+            guard let self else { return }
+            for app in apps {
+                let existing = await self.windows.windows(pid: app.processIdentifier)
+                guard !Task.isCancelled else { return }
+                self.tracker.baseline(existing)
+                self.attachWithRetries(app)
+            }
+        }
         let center = NSWorkspace.shared.notificationCenter
         tokens.append(center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification,
                                          object: nil, queue: .main) { [weak self] note in
@@ -36,8 +58,24 @@ import StageFitCore
         })
     }
 
+    func complete(_ ids: Set<WindowID>, retryable: Set<WindowID>) {
+        guard tracker.isRunning else { return }
+        let result = tracker.complete(ids, retryable: retryable, now: ProcessInfo.processInfo.systemUptime)
+        if !result.expired.isEmpty { onExpired?() }
+        for (delay, retries) in Dictionary(grouping: result.scheduled, by: \.delay) {
+            schedule(delay: delay) { [weak self] in
+                guard let self else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                let ready = Set(retries.compactMap { self.tracker.claimRetry($0.id, now: now) ? $0.id : nil })
+                if !ready.isEmpty { self.enqueue(ready) }
+                if ready.count < retries.count, self.tracker.isRunning { self.onExpired?() }
+            }
+        }
+    }
+
     func stop() {
         generation += 1
+        tasks.values.forEach { $0.cancel() }; tasks.removeAll()
         debounce?.cancel(); debounce = nil; pending.removeAll()
         let center = NSWorkspace.shared.notificationCenter
         tokens.forEach { center.removeObserver($0) }; tokens.removeAll()
@@ -48,17 +86,13 @@ import StageFitCore
     }
 
     private func attachWithRetries(_ app: NSRunningApplication) {
-        let epoch = generation
         for delay in [0.0, 0.3, 1.0, 2.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, self.tracker.isRunning, self.generation == epoch else { return }
-                self.attach(app)
-            }
+            schedule(delay: delay) { [weak self] in await self?.attach(app) }
         }
     }
 
-    private func attach(_ app: NSRunningApplication) {
-        guard tracker.isRunning, windows.isEligible(app) else { return }
+    private func attach(_ app: NSRunningApplication) async {
+        guard tracker.isRunning, AccessibilityWindows.isEligible(app) else { return }
         let pid = app.processIdentifier
         if observers[pid] == nil {
             let element = AXUIElementCreateApplication(pid)
@@ -80,17 +114,20 @@ import StageFitCore
             }
         }
         // Some apps create their first window before the notification subscription is ready.
-        queue(tracker.discover(windows.windows(of: app), pid: pid))
+        let ids = await windows.windows(pid: pid)
+        guard !Task.isCancelled, tracker.isRunning else { return }
+        queue(tracker.discover(ids, pid: pid))
     }
 
     private func discover(pid: pid_t) {
-        guard tracker.isRunning, let app = NSRunningApplication(processIdentifier: pid) else { return }
-        queue(tracker.discover(windows.windows(of: app), pid: pid))
-        // AXWindowCreated may arrive before AXWindows includes the new element.
-        let epoch = generation
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            guard let self, self.tracker.isRunning, self.generation == epoch else { return }
-            self.queue(self.tracker.discover(self.windows.windows(of: app), pid: pid))
+        guard tracker.isRunning else { return }
+        for delay in [0.0, 0.25, 0.75, 1.75, 3.75] {
+            schedule(delay: delay) { [weak self] in
+                guard let self, self.tracker.isRunning else { return }
+                let ids = await self.windows.windows(pid: pid)
+                guard !Task.isCancelled else { return }
+                self.queue(self.tracker.discover(ids, pid: pid))
+            }
         }
     }
 
@@ -98,7 +135,8 @@ import StageFitCore
         if let observer = observers.removeValue(forKey: pid) {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         }
-        tracker.remove(pid: pid); windows.remove(pid: pid)
+        tracker.remove(pid: pid)
+        Task { await windows.remove(pid: pid) }
         pending = pending.filter { $0.pid != pid }
     }
 

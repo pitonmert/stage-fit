@@ -12,28 +12,41 @@ import StageFitCore
     private var permissionTimer: Timer?
     private var recorder: ShortcutRecorder?
     private var trusted = false
-    private var initialSweep = true
     private var lastMessage = "Ready"
     private var shortcutProblem: String?
     private lazy var engine = LayoutEngine(access: windows)
-    private lazy var queue = LayoutQueue { [weak self] job in
+    private lazy var queue: LayoutQueue = LayoutQueue { [weak self] job in
         guard let self else { return }
-        let issues: [LayoutIssue]
+        let report: LayoutReport
         switch job {
-        case .manual: issues = await self.engine.arrangeManually()
-        case .automatic(let ids): issues = await self.engine.arrangeNewWindows(ids)
+        case .manual: report = await self.engine.arrangeManually()
+        case .swapVisible: report = await self.engine.swapVisibleWindows()
+        case .automatic(let ids): report = await self.engine.arrangeNewWindows(ids)
         }
-        guard !Task.isCancelled else { return }
-        if let issue = issues.first {
+        if Task.isCancelled {
+            for issue in report.errors { self.logger.error("\(issue.message, privacy: .public)") }
+            return
+        }
+        if let issue = report.errors.first ?? report.issues.first {
             self.lastMessage = issue.message
-            for issue in issues { self.logger.error("\(issue.message, privacy: .public)") }
+            for issue in report.issues {
+                if issue.requiresAlert { self.logger.error("\(issue.message, privacy: .public) \(issue.diagnosticDetails, privacy: .public)") }
+                else { self.logger.notice("\(issue.message, privacy: .public) \(issue.diagnosticDetails, privacy: .public)") }
+            }
             self.updateTooltip()
-            if case .manual = job { self.showError(issue.message) }
+            if let error = report.errors.first {
+                switch job {
+                case .manual, .swapVisible: self.showError(error.message)
+                case .automatic: break
+                }
+            }
         } else {
-            self.lastMessage = "Ready"; self.updateTooltip()
+            self.lastMessage = report.retryableIDs.isEmpty ? "Ready" : "Waiting for new windows to become ready."
+            self.updateTooltip()
         }
+        if case .automatic(let ids) = job { self.observation.complete(ids, retryable: report.retryableIDs) }
     }
-    private lazy var observation = WindowObservation(windows: windows) { [weak self] ids in
+    private lazy var observation: WindowObservation = WindowObservation(windows: windows) { [weak self] ids in
         self?.queue.submit(.automatic(ids))
     }
 
@@ -47,9 +60,13 @@ import StageFitCore
             button.setAccessibilityLabel("StageFit")
         }
         statusItem = item
+        observation.onExpired = { [weak self] in
+            self?.lastMessage = "A new window did not become ready within the retry limit. Click the menu bar icon to try again."
+            self?.logger.notice("A new window exceeded its readiness retry limit.")
+            self?.updateTooltip()
+        }
         shortcut.onPress = { [weak self] in self?.arrange() }
         registerPreferredShortcut()
-        initialSweep = preferences.automaticSizing
         checkPermission()
         if !trusted {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -86,8 +103,7 @@ import StageFitCore
         if allowed {
             lastMessage = "Ready"
             if preferences.automaticSizing {
-                observation.start(includeExisting: initialSweep)
-                initialSweep = false
+                observation.start()
             }
         } else {
             observation.stop(); queue.cancelAutomatic()
@@ -126,25 +142,30 @@ import StageFitCore
         queue.submit(.manual)
     }
 
+    @objc private func swapVisibleWindows() {
+        guard AXIsProcessTrusted() else {
+            showError(LayoutError.accessibilityRequired.localizedDescription)
+            return
+        }
+        queue.submit(.swapVisible)
+    }
+
     private func showMenu() {
         guard let button = statusItem?.button else { return }
         let menu = NSMenu()
-        let info = NSMenuItem(title: trusted ? lastMessage : "Accessibility permission required", action: nil, keyEquivalent: "")
-        info.isEnabled = false; menu.addItem(info)
-        if let problem = shortcutProblem {
-            let issue = NSMenuItem(title: problem, action: nil, keyEquivalent: "")
-            issue.isEnabled = false; menu.addItem(issue)
-        }
-        menu.addItem(.separator())
+        menu.autoenablesItems = false
+        menu.appearance = NSAppearance(named: .aqua)
+        let swap = NSMenuItem(title: "Swap Visible Windows", action: #selector(swapVisibleWindows), keyEquivalent: "")
+        swap.target = self; swap.isEnabled = trusted
+        menu.addItem(swap)
         let automatic = NSMenuItem(title: "Automatically Size New Windows", action: #selector(toggleAutomatic), keyEquivalent: "")
         automatic.target = self; automatic.state = preferences.automaticSizing ? .on : .off
         menu.addItem(automatic)
         let unavailableLabel = preferences.shortcut == nil ? "Not set" : "Not registered"
         let label = shortcut.current.map(KeyboardLayout.description) ?? unavailableLabel
         add("Change Shortcut… (\(label))", action: #selector(changeShortcut), to: menu)
-        add("Open Accessibility Settings…", action: #selector(openAccessibilitySettings), to: menu)
         menu.addItem(.separator())
-        add("Quit StageFit", action: #selector(quit), to: menu)
+        add("Quit", action: #selector(quit), to: menu)
         menu.popUp(positioning: nil, at: CGPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
 
@@ -155,8 +176,7 @@ import StageFitCore
 
     @objc private func toggleAutomatic() {
         preferences.automaticSizing.toggle()
-        initialSweep = false
-        if preferences.automaticSizing, AXIsProcessTrusted() { observation.start(includeExisting: false) }
+        if preferences.automaticSizing, AXIsProcessTrusted() { observation.start() }
         else { observation.stop(); queue.cancelAutomatic() }
         updateTooltip()
     }
@@ -174,12 +194,6 @@ import StageFitCore
             self?.recorder = nil
             self?.registerPreferredShortcut()
         })
-    }
-
-    @objc private func openAccessibilitySettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
